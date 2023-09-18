@@ -141,6 +141,10 @@ def main(args):
         elif args.model_name == "guanaco-13b":
             model_name = "llama-13b"
             adapters_name = 'timdettmers/guanaco-13b'
+        else:
+            model_name = args.model_name
+            adapters_name = None
+
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         args.ngpus = torch.cuda.device_count() if args.ngpus is None else args.ngpus
         model = AutoModelForCausalLM.from_pretrained(
@@ -230,6 +234,7 @@ def main(args):
                 log_stat['score'] =  scores[0]
                 log_stat['pvalue'] =  pvalues[0]
                 log_stat['log10_pvalue'] = float(np.log10(log_stat['pvalue']))
+                log_stat['message'] = payloads[0]
             if args.json_path_ori is not None:
                 # compute sbert score
                 text_orig = results_orig[ii]
@@ -241,7 +246,7 @@ def main(args):
         df = pd.DataFrame(log_stats)
         print(f">>> Scores: \n{df.describe(percentiles=[])}")
         print(f"Saved scores to {os.path.join(args.output_dir, 'scores.csv')}")
-
+        breakpoint()
 
 if __name__ == "__main__":
     args = get_args_parser().parse_args()

@@ -24,7 +24,10 @@ class WmGenerator():
         # model config
         self.tokenizer = tokenizer
         self.model = model
-        self.max_seq_len = model.config.max_sequence_length
+        try:
+            self.max_seq_len = model.config.max_sequence_length
+        except:
+            self.max_seq_len = 1_000_000
         self.pad_id = model.config.pad_token_id
         self.eos_id = model.config.eos_token_id
         # watermark config
@@ -92,7 +95,8 @@ class WmGenerator():
         prev_pos = 0
         for cur_pos in range(start_pos, total_len):
             outputs = self.model.forward(
-                tokens[:, prev_pos:cur_pos], use_cache=True, past_key_values=outputs.past_key_values if prev_pos > 0 else None
+                tokens[:, prev_pos:cur_pos], use_cache=True, past_key_values=outputs.past_key_values
+                if prev_pos > 0 else None
             )
             ngram_tokens = tokens[:, cur_pos-self.ngram:cur_pos]
             next_toks = self.sample_next(outputs.logits[:, -1, :], ngram_tokens, temperature, top_p)

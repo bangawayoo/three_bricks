@@ -21,6 +21,7 @@ python main_watermark.py --model_name guanaco-7b \
 import argparse
 from typing import Dict, List
 import os
+import math
 import time
 import json
 
@@ -36,10 +37,14 @@ from sentence_transformers import SentenceTransformer
 from wm import (WmGenerator, OpenaiGenerator, OpenaiDetector, OpenaiNeymanPearsonDetector, 
                 OpenaiDetectorZ, MarylandGenerator, MarylandDetector, MarylandDetectorZ)
 import utils
-
+from wm.dataset_utils import load_hf_dataset
+from wm.wm_utils import compute_ber
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Args', add_help=False)
+    # data parameters
+    parser.add_argument('--dataset_name', type=str, default=None)
+    parser.add_argument('--dataset_config_name', type=str, default=None)
 
     # model parameters
     parser.add_argument('--model_name', type=str)
@@ -98,6 +103,7 @@ def get_args_parser():
     # distributed parameters
     parser.add_argument('--ngpus', type=int, default=None)
 
+    parser.add_argument('--overwrite', type=utils.bool_inst, default=False)
     return parser
 
 
@@ -137,6 +143,7 @@ def load_prompts(json_path: str, prompt_type: str, nsamples: int=None) -> List[s
     new_prompts = format_prompts(new_prompts, prompt_type)
     return new_prompts
 
+
 def load_results(json_path: str, nsamples: int=None, result_key: str='result') -> List[str]:
     with open(json_path, "r") as f:
         if json_path.endswith('.json'):
@@ -166,7 +173,13 @@ def main(args):
     elif args.model_name == "guanaco-13b":
         model_name = "llama-13b"
         adapters_name = 'timdettmers/guanaco-13b'
+    else:
+        model_name = args.model_name
+        adapters_name = None
+
+    args.model_name = model_name
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    args.tokenizer = tokenizer
     args.ngpus = torch.cuda.device_count() if args.ngpus is None else args.ngpus
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -181,6 +194,7 @@ def main(args):
     for param in model.parameters():
         param.requires_grad = False
     print(f"Using {args.ngpus}/{torch.cuda.device_count()} GPUs - {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated per GPU")
+
 
     # build watermark generator
     if args.method == "none":
@@ -197,7 +211,10 @@ def main(args):
         prompts = args.prompt
         prompts = [{"instruction": prompt} for prompt in prompts]
     else:
-        prompts = load_prompts(json_path=args.prompt_path, prompt_type=args.prompt_type, nsamples=args.nsamples)
+        if args.dataset_name:
+            prompts = load_hf_dataset(args)
+        else:
+            prompts = load_prompts(json_path=args.prompt_path, prompt_type=args.prompt_type, nsamples=args.nsamples)
 
     # do splits
     if args.split is not None:
@@ -210,7 +227,7 @@ def main(args):
     # (re)start experiment
     os.makedirs(args.output_dir, exist_ok=True)
     start_point = 0 # if resuming, start from the last line of the file
-    if os.path.exists(os.path.join(args.output_dir, f"results.jsonl")):
+    if os.path.exists(os.path.join(args.output_dir, f"results.jsonl")) and not args.overwrite:
         with open(os.path.join(args.output_dir, f"results.jsonl"), "r") as f:
             for _ in f:
                 start_point += 1
@@ -295,6 +312,12 @@ def main(args):
                 # use exact formula for high values and (more stable) upper bound for lower values
                 M = args.payload_max+1
                 pvalues = [(1 - (1 - pvalue)**M) if pvalue > min(1 / M, 1e-5) else M * pvalue for pvalue in pvalues]
+                # compute bit accuracy here
+                bit_width = math.ceil(math.log2(args.payload_max))
+                gold_msg = format(args.payload, f"0{bit_width}b")
+                pred_msg = format(payloads[0], f"0{bit_width}b")
+                correct, total = compute_ber(pred_msg, gold_msg)
+
             else:
                 payloads = [ 0 ] * len(pvalues)
                 pvalues = pvalues[:,0].tolist()
@@ -313,6 +336,7 @@ def main(args):
                 'all_pvalues': all_pvalues[0],
                 'score_sbert': score_sbert,
                 'payload': payloads[0],
+                "acc": correct / total
             }
             log_stats.append(log_stat)
             f.write(json.dumps(log_stat)+'\n')
@@ -321,6 +345,9 @@ def main(args):
         df['log10_pvalue'] = np.log10(df['pvalue'])
         print(f">>> Scores: \n{df.describe(percentiles=[])}")
         print(f"Saved scores to {os.path.join(args.output_dir, 'scores.csv')}")
+
+
+
 
 
 if __name__ == "__main__":

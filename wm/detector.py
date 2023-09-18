@@ -113,7 +113,7 @@ class WmDetector():
                     if tup_for_unique in seen_ntuples:
                         continue
                     seen_ntuples.add(tup_for_unique)
-                rt = self.score_tok(ngram_tokens, tokens_id[ii][cur_pos]) 
+                rt = self.score_tok(ngram_tokens, tokens_id[ii][cur_pos]) # scores of vocabulary size rolled by the current token_id, i.e. rt[0] = 1 if current token is in the greenlist
                 rt = rt.numpy()[:payload_max+1]
                 rts.append(rt)
             score_lists.append(rts)
