@@ -67,7 +67,7 @@ def get_args_parser():
                         help='watermark context width for rng key generation')
     parser.add_argument('--gamma', type=float, default=0.25, 
                         help='gamma for maryland: proportion of greenlist tokens')
-    parser.add_argument('--delta', type=float, default=4.0, 
+    parser.add_argument('--delta', type=float, default=10.0,
                         help='delta for maryland: bias to add to greenlist tokens')
     parser.add_argument('--hash_key', type=int, default=35317, 
                         help='hash key for rng key generation')
@@ -157,10 +157,13 @@ def main(args):
     np.random.seed(args.seed)
 
     # build model
-    if args.model_name == "llama-7b":
+    if "llama-2" in args.model_name.lower():
+        model_name = args.model_name
+        adapters_name = None
+    elif args.model_name == "llama-7b":
         model_name = "llama-7b"
         adapters_name = None
-    if args.model_name == "guanaco-7b":
+    elif args.model_name == "guanaco-7b":
         model_name = "llama-7b"
         adapters_name = 'timdettmers/guanaco-7b'
     elif args.model_name == "guanaco-13b":
@@ -175,6 +178,7 @@ def main(args):
         max_memory={i: '32000MB' for i in range(args.ngpus)},
         offload_folder="offload",
     )
+    model.config.max_sequence_length = 4096
     if adapters_name is not None:
         model = PeftModel.from_pretrained(model, adapters_name)
     model = model.eval()
