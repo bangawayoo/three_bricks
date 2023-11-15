@@ -188,6 +188,9 @@ def main(args):
         max_memory={i: '32000MB' for i in range(args.ngpus)},
         offload_folder="offload",
     )
+    if "llama-2" in args.model_name.lower():
+        model.config.pad_token_id = 0
+        model.config.max_sequence_length = 4096
     if adapters_name is not None:
         model = PeftModel.from_pretrained(model, adapters_name)
     model = model.eval()

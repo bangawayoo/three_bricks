@@ -1,14 +1,16 @@
-export CUDA_VISIBLE_DEVICES="0,1"
+export CUDA_VISIBLE_DEVICES="1"
 
 MODEL_NAME="meta-llama/Llama-2-7b-hf"
 python main_watermark.py --model_name $MODEL_NAME \
-    --prompt_type guanaco --prompt_path data/alpaca_data.json --nsamples 10 --batch_size 1 \
+    --prompt_type guanaco --prompt_path data/alpaca_data.json --nsamples 5 --batch_size 1 \
     --method openai --temperature 1.0 --seeding hash --ngram 2 --scoring_method v2 \
     --delta 4 --gamma 0.25 \
     --payload 2 --payload_max 4 \
     --output_dir output/ \
-    --method_detect "same" --do_eval T --overwrite F \
-    --dataset_config_name "realnewslike" --dataset_name "c4" \
+    --method_detect "same" --do_eval T --overwrite T
+
+
+#    --dataset_config_name "realnewslike" --dataset_name "c4" \
 
 
 #python main_eval.py \
