@@ -4,7 +4,7 @@ huggingface-cli login --token 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 --token hf_Q
 MODEL_NAME="meta-llama/Llama-2-7b-hf"
 python main_watermark.py --model_name $MODEL_NAME \
     --prompt_type guanaco --prompt_path data/alpaca_data.json --nsamples 3 --batch_size 1 \
-    --method "openai" --temperature 1.0 --seeding hash --ngram 2 --scoring_method v2 \
+    --method "openai" --temperature 0 --seeding hash --ngram 2 --scoring_method v2 \
     --delta 4 --gamma 0.25 \
     --payload 3 --payload_max 4 \
     --output_dir output/ \

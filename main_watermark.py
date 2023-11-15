@@ -98,6 +98,8 @@ def get_args_parser():
     # distributed parameters
     parser.add_argument('--ngpus', type=int, default=None)
 
+    parser.add_argument("--overwrite", type=utils.bool_inst, default=True)
+
     return parser
 
 
@@ -216,10 +218,11 @@ def main(args):
     # (re)start experiment
     os.makedirs(args.output_dir, exist_ok=True)
     start_point = 0 # if resuming, start from the last line of the file
-    if os.path.exists(os.path.join(args.output_dir, f"results.jsonl")):
-        with open(os.path.join(args.output_dir, f"results.jsonl"), "r") as f:
-            for _ in f:
-                start_point += 1
+    if not args.overwrite:
+        if os.path.exists(os.path.join(args.output_dir, f"results.jsonl")):
+            with open(os.path.join(args.output_dir, f"results.jsonl"), "r") as f:
+                for _ in f:
+                    start_point += 1
     print(f"Starting from {start_point}")
 
     # generate
@@ -256,7 +259,7 @@ def main(args):
         args.method_detect = args.method
     if (not args.do_eval) or (args.method_detect not in ["openai", "maryland", "marylandz", "openaiz", "openainp"]):
         return
-    
+
     # build watermark detector
     if args.method_detect == "openai":
         detector = OpenaiDetector(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key)
