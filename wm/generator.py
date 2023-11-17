@@ -71,12 +71,13 @@ class WmGenerator():
         max_gen_len: int,
         temperature: float = 0.8,
         top_p: float = 0.95,
+        payload: int = 0,
     ) -> List[str]:
         """
         Generate text from prompts. 
         Adapted from https://github.com/facebookresearch/llama/
         """
-        
+        self.payload = payload
         bsz = len(prompts)
         prompt_tokens = [self.tokenizer.encode(x, add_special_tokens=False) for x in prompts]
         min_prompt_size = min([len(t) for t in prompt_tokens])
@@ -100,6 +101,7 @@ class WmGenerator():
             prev_pos = cur_pos
 
         decoded = []
+        generated_token_len = []
         for i, t in enumerate(tokens.tolist()):
             # cut to max gen len
             t = t[: len(prompt_tokens[i]) + max_gen_len]
@@ -108,9 +110,12 @@ class WmGenerator():
                 t = t[: t.index(self.eos_id)]
             except ValueError:
                 pass
-            decoded.append(self.tokenizer.decode(t))
+            gen_text = self.tokenizer.decode(t)
+            decoded.append(gen_text)
+            token_len = len(self.tokenizer(gen_text.replace(prompts[i], ""), add_special_tokens=False)['input_ids'])
+            generated_token_len.append(token_len)
 
-        return decoded
+        return decoded, generated_token_len
     
     def sample_next(
         self,

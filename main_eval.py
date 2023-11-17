@@ -17,6 +17,8 @@ import argparse
 from typing import List
 import os
 import json
+import math
+import random
 
 import tqdm
 import pandas as pd
@@ -29,6 +31,10 @@ from sentence_transformers import SentenceTransformer
 
 from wm import (OpenaiDetector, OpenaiDetectorZ, OpenaiNeymanPearsonDetector, 
                 MarylandDetector, MarylandDetectorZ)
+from wm.wm_utils import compute_ber
+from wm.dataset_utils import load_hf_dataset
+from wm.attack_utils import run_copy_paste_attack
+
 import utils
 
 def get_args_parser():
@@ -63,7 +69,6 @@ def get_args_parser():
                         none (score every tokens), v1 (score token when wm context is unique), \
                         v2 (score token when {wm context + token} is unique')
 
-
     # multibit
     parser.add_argument('--payload', type=int, default=0, 
                         help='message')
@@ -76,6 +81,16 @@ def get_args_parser():
                         none (no attack), tok_substitution (randomly substitute tokens)')
     parser.add_argument('--attack_param', type=float, default=0,
                         help='attack parameter. For tok_substitution, it is the probability of substitution')
+    parser.add_argument('--srcp', type=float, default=0.9,
+                        help='attack parameter for copy-paste. Percentage of watermarked text to preserve.')
+    parser.add_argument('--max_gen_len', type=int, default=250,
+                        help='Max generation length parameter given during generation. '
+                             'This determines the total length after the copy-paste attack.')
+
+    # data parameters
+    parser.add_argument('--dataset_name', type=str, default=None)
+    parser.add_argument('--dataset_config_name', type=str, default=None)
+    parser.add_argument('--limit_rows', type=int, default=5000)
 
     # useless
     parser.add_argument('--delta', type=float, default=2.0, 
@@ -100,15 +115,15 @@ def get_args_parser():
 
     return parser
 
-def load_results(json_path: str, nsamples: int=None, text_key: str='result') -> List[str]:
+def load_results(json_path: str, nsamples: int=None, result_key: str='result') -> List[str]:
     with open(json_path, "r") as f:
         if json_path.endswith('.json'):
-            prompts = json.loads(f.read())
+            raw_data = json.loads(f.read())
         else:
-            prompts = [json.loads(line) for line in f.readlines()] # load jsonl
-    new_prompts = [o[text_key] for o in prompts]
+            raw_data = [json.loads(line) for line in f.readlines()] # load jsonl
+    new_prompts = [o[result_key] for o in raw_data]
     new_prompts = new_prompts[:nsamples]
-    return new_prompts
+    return new_prompts, raw_data
 
 def main(args):
 
@@ -120,6 +135,7 @@ def main(args):
 
     # build tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_dir)
+    args.tokenizer = tokenizer
 
     # build watermark detector
     if args.method == "openai":
@@ -132,6 +148,9 @@ def main(args):
         detector = MarylandDetectorZ(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key, gamma=args.gamma, delta=args.delta)
     elif args.method == "openainp":
         # build model
+        if "llama-2" in args.model_name.lower():
+            model_name = args.model_name
+            adapters_name = None
         if args.model_name == "llama-7b":
             model_name = "llama-7b"
             adapters_name = None
@@ -142,6 +161,7 @@ def main(args):
             model_name = "llama-13b"
             adapters_name = 'timdettmers/guanaco-13b'
         tokenizer = AutoTokenizer.from_pretrained(model_name)
+        args.tokenizer = tokenizer
         args.ngpus = torch.cuda.device_count() if args.ngpus is None else args.ngpus
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -152,6 +172,10 @@ def main(args):
         )
         if adapters_name is not None:
             model = PeftModel.from_pretrained(model, adapters_name)
+        if not hasattr(model.config, 'max_sequence_length'):
+            model.config.max_sequence_length = 4096
+        if not hasattr(model.config, 'pad_token_id') or getattr(model.config, 'pad_token_id') is None:
+            model.config.pad_token_id = 0
         model = model.eval()
         for param in model.parameters():
             param.requires_grad = False
@@ -159,7 +183,7 @@ def main(args):
         detector = OpenaiNeymanPearsonDetector(model, tokenizer, args.ngram, args.seed, args.seeding, args.hash_key)
 
     # load results and (optional) do splits
-    results = load_results(json_path=args.json_path, text_key=args.text_key, nsamples=args.nsamples)
+    results, raw_data = load_results(json_path=args.json_path, result_key=args.text_key, nsamples=args.nsamples)
     print(f"Loaded {len(results)} results.")
     if args.split is not None:
         nresults = len(results)
@@ -184,6 +208,8 @@ def main(args):
             results = [attack(text) for text in results]
             print(f"Attacked results with {attack_name}({attack_param})")
             print(results[:2])
+    elif attack_name == "copy-paste":
+        results = run_copy_paste_attack(args, results)
 
     # evaluate
     log_stats = []
@@ -194,7 +220,7 @@ def main(args):
         if args.json_path_ori is not None:
             sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
             cossim = torch.nn.CosineSimilarity(dim=0, eps=1e-6)
-            results_orig = load_results(json_path=args.json_path_ori, nsamples=args.nsamples, text_key=args.text_key_ori)
+            results_orig, _ = load_results(json_path=args.json_path_ori, nsamples=args.nsamples, text_key=args.text_key_ori)
             if args.split is not None:
                 results_orig = results_orig[left:right]
 
@@ -221,15 +247,24 @@ def main(args):
                     # use exact formula for high values and (more stable) upper bound for lower values
                     M = args.payload_max+1
                     pvalues = [(1 - (1 - pvalue)**M) if pvalue > min(1 / M, 1e-5) else M * pvalue for pvalue in pvalues]
+                    bit_width = math.ceil(math.log2(args.payload_max))
+                    example = raw_data[ii]
+                    gold_msg = format(example['gt_payload'], f"0{bit_width}b")
+                    pred_msg = format(payloads[0], f"0{bit_width}b")
+                    correct, total = compute_ber(pred_msg, gold_msg)
                 else:
                     payloads = [ 0 ] * len(pvalues)
                     pvalues = pvalues[:,0].tolist()
                     scores = [float(s[0]) for s in scores]
+
                 num_tokens = [len(score_no_aggreg) for score_no_aggreg in scores_no_aggreg]
                 log_stat['num_token'] =  num_tokens[0]
                 log_stat['score'] =  scores[0]
                 log_stat['pvalue'] =  pvalues[0]
                 log_stat['log10_pvalue'] = float(np.log10(log_stat['pvalue']))
+                log_stat['acc'] = correct / total
+                log_stat['payload'] = payloads[0]
+
             if args.json_path_ori is not None:
                 # compute sbert score
                 text_orig = results_orig[ii]
@@ -240,6 +275,8 @@ def main(args):
             f.write('\n' + json.dumps(log_stat))
         df = pd.DataFrame(log_stats)
         print(f">>> Scores: \n{df.describe(percentiles=[])}")
+        with open(os.path.join(args.output_dir, "summary.log"), "w") as file:
+            print(f">>> Scores: \n{df.describe(percentiles=[])}", file=file)
         print(f"Saved scores to {os.path.join(args.output_dir, 'scores.csv')}")
 
 

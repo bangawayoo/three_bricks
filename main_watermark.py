@@ -23,6 +23,7 @@ from typing import Dict, List
 import os
 import time
 import json
+import math 
 
 import tqdm
 import pandas as pd
@@ -35,6 +36,8 @@ from sentence_transformers import SentenceTransformer
 
 from wm import (WmGenerator, OpenaiGenerator, OpenaiDetector, OpenaiNeymanPearsonDetector, 
                 OpenaiDetectorZ, MarylandGenerator, MarylandDetector, MarylandDetectorZ)
+from wm.wm_utils import compute_ber
+from wm.dataset_utils import load_hf_dataset
 import utils
 
 
@@ -50,11 +53,15 @@ def get_args_parser():
                         help='type of prompt formatting. Choose between: alpaca, oasst, guanaco')
     parser.add_argument('--prompt', type=str, nargs='+', default=None, 
                         help='prompt to use instead of prompt_path, can be a list')
+    # data parameters
+    parser.add_argument('--dataset_name', type=str, default=None)
+    parser.add_argument('--dataset_config_name', type=str, default=None)
+    parser.add_argument('--limit_rows', type=int, default=5000)
 
     # generation parameters
     parser.add_argument('--temperature', type=float, default=0.8)
     parser.add_argument('--top_p', type=float, default=0.95)
-    parser.add_argument('--max_gen_len', type=int, default=256)
+    parser.add_argument('--max_gen_len', type=int, default=250)
 
     # watermark parameters
     parser.add_argument('--method', type=str, default='none', 
@@ -142,12 +149,12 @@ def load_prompts(json_path: str, prompt_type: str, nsamples: int=None) -> List[s
 def load_results(json_path: str, nsamples: int=None, result_key: str='result') -> List[str]:
     with open(json_path, "r") as f:
         if json_path.endswith('.json'):
-            prompts = json.loads(f.read())
+            raw_data = json.loads(f.read())
         else:
-            prompts = [json.loads(line) for line in f.readlines()] # load jsonl
-    new_prompts = [o[result_key] for o in prompts]
+            raw_data = [json.loads(line) for line in f.readlines()] # load jsonl
+    new_prompts = [o[result_key] for o in raw_data]
     new_prompts = new_prompts[:nsamples]
-    return new_prompts
+    return new_prompts, raw_data
 
 
 def main(args):
@@ -171,7 +178,12 @@ def main(args):
     elif args.model_name == "guanaco-13b":
         model_name = "llama-13b"
         adapters_name = 'timdettmers/guanaco-13b'
+    else:
+        model_name = args.model_name
+        adapters_name = None
+
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    args.tokenizer = tokenizer
     args.ngpus = torch.cuda.device_count() if args.ngpus is None else args.ngpus
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -180,11 +192,12 @@ def main(args):
         max_memory={i: '32000MB' for i in range(args.ngpus)},
         offload_folder="offload",
     )
-    if "llama-2" in args.model_name.lower():
-        model.config.pad_token_id = 0
-        model.config.max_sequence_length = 4096
     if adapters_name is not None:
         model = PeftModel.from_pretrained(model, adapters_name)
+    if not hasattr(model.config, 'max_sequence_length'):
+        model.config.max_sequence_length = 4096
+    if not hasattr(model.config, 'pad_token_id') or getattr(model.config, 'pad_token_id') is None:
+        model.config.pad_token_id = 0
     model = model.eval()
     for param in model.parameters():
         param.requires_grad = False
@@ -205,7 +218,11 @@ def main(args):
         prompts = args.prompt
         prompts = [{"instruction": prompt} for prompt in prompts]
     else:
-        prompts = load_prompts(json_path=args.prompt_path, prompt_type=args.prompt_type, nsamples=args.nsamples)
+        if args.dataset_name:
+            args.return_type = "prompt"
+            prompts = load_hf_dataset(args)
+        else:
+            prompts = load_prompts(json_path=args.prompt_path, prompt_type=args.prompt_type, nsamples=args.limit_rows)
 
     # do splits
     if args.split is not None:
@@ -227,16 +244,22 @@ def main(args):
 
     # generate
     all_times = []
-    with open(os.path.join(args.output_dir, f"results.jsonl"), "a") as f:
+    write_type = "w" if args.overwrite else "a"
+    import random
+    writer = open(os.path.join(args.output_dir, f"results.jsonl"), write_type)
+    valid_cnt = start_point
+    with open(os.path.join(args.output_dir, f"all_results.jsonl"), write_type) as f:
         for ii in range(start_point, len(prompts), args.batch_size):
             # generate chunk
             time0 = time.time()
             chunk_size = min(args.batch_size, len(prompts) - ii)
-            results = generator.generate(
+            gt_payload = random.randint(0, args.payload_max)
+            results, token_lengths = generator.generate(
                 prompts[ii:ii+chunk_size], 
                 max_gen_len=args.max_gen_len, 
                 temperature=args.temperature, 
-                top_p=args.top_p
+                top_p=args.top_p,
+                payload=gt_payload
             )
             time1 = time.time()
             # time chunk
@@ -245,14 +268,36 @@ def main(args):
             eta = time.strftime("%Hh%Mm%Ss", time.gmtime(eta)) 
             all_times.append(time1 - time0)
             print(f"Generated {ii:5d} - {ii+chunk_size:5d} - Speed {speed:.2f} prompts/s - ETA {eta}")
+            # check if output is valid
+            filtered_prompts, filtered_results = [], []
+            for g_idx, g_token in enumerate(token_lengths):
+                if g_token > args.max_gen_len - 25:
+                    filtered_prompts.append(prompts[ii + g_idx])
+                    filtered_results.append(results[g_idx])
+                    valid_cnt += 1
+            
+            for prompt, result in zip(filtered_prompts, filtered_results):
+                writer.write(json.dumps({
+                    "prompt": prompt, 
+                    "result": result[len(prompt):],
+                    "speed": speed,
+                    'gt_payload': gt_payload,
+                    "eta": eta}) + "\n")
+                writer.flush()
+
             # log
             for prompt, result in zip(prompts[ii:ii+chunk_size], results):
                 f.write(json.dumps({
                     "prompt": prompt, 
                     "result": result[len(prompt):],
                     "speed": speed,
+                    'gt_payload': gt_payload,
                     "eta": eta}) + "\n")
                 f.flush()
+            
+            if valid_cnt >= args.nsamples:
+                break 
+                
     print(f"Average time per prompt: {np.sum(all_times) / (len(prompts) - start_point) :.2f}")
 
     if args.method_detect == 'same':
@@ -268,23 +313,26 @@ def main(args):
     elif args.method_detect == "openainp":
         detector = OpenaiNeymanPearsonDetector(model, tokenizer, args.ngram, args.seed, args.seeding, args.hash_key)
     elif args.method_detect == "maryland":
-        detector = MarylandDetector(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key, gamma=args.gamma, delta=args.delta)
+        detector = MarylandDetector(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
+                                    gamma=args.gamma, delta=args.delta)
     elif args.method_detect == "marylandz":
-        detector = MarylandDetectorZ(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key, gamma=args.gamma, delta=args.delta)
+        detector = MarylandDetectorZ(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
+                                     gamma=args.gamma, delta=args.delta)
 
     # build sbert model
     sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
     cossim = torch.nn.CosineSimilarity(dim=0, eps=1e-6)
-    results_orig = load_results(json_path=args.prompt_path, nsamples=args.nsamples, result_key="output")
+    results_orig, _ = load_results(json_path=args.prompt_path, nsamples=args.nsamples, result_key="output")
     if args.split is not None:
         results_orig = results_orig[left:right]
 
     # evaluate
-    results = load_results(json_path=os.path.join(args.output_dir, f"results.jsonl"), nsamples=args.nsamples, result_key="result")
+    results, raw_data = load_results(json_path=os.path.join(args.output_dir, f"results.jsonl"), nsamples=args.nsamples,
+                           result_key="result")
     log_stats = []
     text_index = left if args.split is not None else 0
     with open(os.path.join(args.output_dir, 'scores.jsonl'), 'w') as f:
-        for text, text_orig in tqdm.tqdm(zip(results, results_orig)):
+        for text, text_orig, example in tqdm.tqdm(zip(results, results_orig, raw_data)):
             # compute watermark score
             if args.method_detect == "openainp":
                 scores_no_aggreg, probs = detector.get_scores_by_t([text], scoring_method=args.scoring_method, payload_max=args.payload_max)
@@ -304,6 +352,11 @@ def main(args):
                 # use exact formula for high values and (more stable) upper bound for lower values
                 M = args.payload_max+1
                 pvalues = [(1 - (1 - pvalue)**M) if pvalue > min(1 / M, 1e-5) else M * pvalue for pvalue in pvalues]
+                bit_width = math.ceil(math.log2(args.payload_max))
+                gold_msg = format(example['gt_payload'], f"0{bit_width}b")
+                pred_msg = format(payloads[0], f"0{bit_width}b")
+                correct, total = compute_ber(pred_msg, gold_msg)
+                
             else:
                 payloads = [ 0 ] * len(pvalues)
                 pvalues = pvalues[:,0].tolist()
@@ -322,13 +375,15 @@ def main(args):
                 'all_pvalues': all_pvalues[0],
                 'score_sbert': score_sbert,
                 'payload': payloads[0],
+                'acc': correct / total
             }
             log_stats.append(log_stat)
             f.write(json.dumps(log_stat)+'\n')
             text_index += 1
         df = pd.DataFrame(log_stats)
         df['log10_pvalue'] = np.log10(df['pvalue'])
-        print(f">>> Scores: \n{df.describe(percentiles=[])}")
+        with open(os.path.join(args.output_dir, "summary.log"), "w") as file:
+            print(f">>> Scores: \n{df.describe(percentiles=[])}", file=file)
         print(f"Saved scores to {os.path.join(args.output_dir, 'scores.csv')}")
 
 
