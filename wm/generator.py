@@ -19,7 +19,8 @@ class WmGenerator():
             seed: int = 0,
             seeding: str = 'hash',
             salt_key: int = 35317,
-            payload: int = 0
+            payload: int = 0,
+            payload_max: int = 255,
         ):
         # model config
         self.tokenizer = tokenizer
@@ -36,6 +37,7 @@ class WmGenerator():
         self.rng = torch.Generator()
         self.rng.manual_seed(self.seed)
         self.payload = payload
+        self.payload_max = payload_max
 
     def hashint(self, integer_tensor: torch.LongTensor) -> torch.LongTensor:
         """Adapted from https://github.com/jwkirchenbauer/lm-watermarking"""
@@ -142,7 +144,7 @@ class WmGenerator():
 class OpenaiGenerator(WmGenerator):
     """ Generate text using LLaMA and Aaronson's watermarking method. """
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)        
+        super().__init__(*args, **kwargs)
 
     def sample_next(
         self,
@@ -165,13 +167,15 @@ class OpenaiGenerator(WmGenerator):
             mask = probs_sum - probs_sort > top_p
             probs_sort[mask] = 0.0
             probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+            r_dim = max(self.payload_max, self.tokenizer.vocab_size)
             for ii in range(ngram_tokens.shape[0]): # batch of texts
                 # seed with hash of ngram tokens
                 seed = self.get_seed_rng(ngram_tokens[ii])
                 self.rng.manual_seed(seed)
                 # generate rs randomly between [0,1]
-                rs = torch.rand(self.tokenizer.vocab_size, generator=self.rng) # n
-                rs = rs.roll(-self.payload)
+                # rs = torch.rand(self.tokenizer.vocab_size, generator=self.rng) # n
+                rs = torch.rand(r_dim, generator=self.rng)
+                rs = rs.roll(-self.payload)[:self.tokenizer.vocab_size]
                 rs = torch.Tensor(rs).to(probs_sort.device)
                 rs = rs[probs_idx[ii]] 
                 # compute r^(1/p)

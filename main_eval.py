@@ -139,13 +139,17 @@ def main(args):
 
     # build watermark detector
     if args.method == "openai":
-        detector = OpenaiDetector(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key)
+        detector = OpenaiDetector(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
+                                  payload_max=args.payload_max)
     elif args.method == "openaiz":
-        detector = OpenaiDetectorZ(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key)
+        detector = OpenaiDetectorZ(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
+                                   payload_max=args.payload_max)
     elif args.method == "maryland":
-        detector = MarylandDetector(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key, gamma=args.gamma, delta=args.delta)
+        detector = MarylandDetector(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
+                                    payload_max=args.payload_max, gamma=args.gamma, delta=args.delta)
     elif args.method == "marylandz":
-        detector = MarylandDetectorZ(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key, gamma=args.gamma, delta=args.delta)
+        detector = MarylandDetectorZ(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
+                                     payload_max=args.payload_max, gamma=args.gamma, delta=args.delta)
     elif args.method == "openainp":
         # build model
         if "llama-2" in args.model_name.lower():
@@ -180,7 +184,8 @@ def main(args):
         for param in model.parameters():
             param.requires_grad = False
         print(f"Using {args.ngpus}/{torch.cuda.device_count()} GPUs - {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated per GPU")
-        detector = OpenaiNeymanPearsonDetector(model, tokenizer, args.ngram, args.seed, args.seeding, args.hash_key)
+        detector = OpenaiNeymanPearsonDetector(model, tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
+                                               payload_max=args.payload_max)
 
     # load results and (optional) do splits
     results, raw_data = load_results(json_path=args.json_path, result_key=args.text_key, nsamples=args.nsamples)

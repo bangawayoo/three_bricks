@@ -207,9 +207,12 @@ def main(args):
     if args.method == "none":
         generator = WmGenerator(model, tokenizer)
     elif args.method == "openai":
-        generator = OpenaiGenerator(model, tokenizer, args.ngram, args.seed, args.seeding, args.hash_key, payload=args.payload)
+        generator = OpenaiGenerator(model, tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
+                                    payload=args.payload, payload_max=args.payload_max)
     elif args.method == "maryland":
-        generator = MarylandGenerator(model, tokenizer, args.ngram, args.seed, args.seeding, args.hash_key, payload=args.payload, gamma=args.gamma, delta=args.delta)
+        generator = MarylandGenerator(model, tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
+                                      payload=args.payload, gamma=args.gamma, delta=args.delta,
+                                      payload_max=args.payload_max)
     else:
         raise NotImplementedError("method {} not implemented".format(args.method))
 
@@ -307,17 +310,20 @@ def main(args):
 
     # build watermark detector
     if args.method_detect == "openai":
-        detector = OpenaiDetector(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key)
+        detector = OpenaiDetector(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
+                                  payload_max=args.payload_max)
     elif args.method_detect == "openaiz":
-        detector = OpenaiDetectorZ(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key)
+        detector = OpenaiDetectorZ(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
+                                   payload_max=args.payload_max)
     elif args.method_detect == "openainp":
-        detector = OpenaiNeymanPearsonDetector(model, tokenizer, args.ngram, args.seed, args.seeding, args.hash_key)
+        detector = OpenaiNeymanPearsonDetector(model, tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
+                                               payload_max=args.payload_max)
     elif args.method_detect == "maryland":
         detector = MarylandDetector(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
-                                    gamma=args.gamma, delta=args.delta)
+                                    gamma=args.gamma, delta=args.delta, payload_max=args.payload_max)
     elif args.method_detect == "marylandz":
         detector = MarylandDetectorZ(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
-                                     gamma=args.gamma, delta=args.delta)
+                                     gamma=args.gamma, delta=args.delta, payload_max=args.payload_max)
 
     # build sbert model
     sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -382,6 +388,7 @@ def main(args):
             text_index += 1
         df = pd.DataFrame(log_stats)
         df['log10_pvalue'] = np.log10(df['pvalue'])
+        print(f">>> Scores: \n{df.describe(percentiles=[])}")
         with open(os.path.join(args.output_dir, "summary.log"), "w") as file:
             print(f">>> Scores: \n{df.describe(percentiles=[])}", file=file)
         print(f"Saved scores to {os.path.join(args.output_dir, 'scores.csv')}")

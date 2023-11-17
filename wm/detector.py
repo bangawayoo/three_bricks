@@ -21,7 +21,8 @@ class WmDetector():
             ngram: int = 1,
             seed: int = 0,
             seeding: str = 'hash',
-            salt_key: int = 35317
+            salt_key: int = 35317,
+            payload_max: int = 0,
         ):
         # model config
         self.tokenizer = tokenizer
@@ -34,6 +35,7 @@ class WmDetector():
         self.seeding = seeding 
         self.rng = torch.Generator()
         self.rng.manual_seed(self.seed)
+        self.payload_max = payload_max
 
     def hashint(self, integer_tensor: torch.LongTensor) -> torch.LongTensor:
         """Adapted from https://github.com/jwkirchenbauer/lm-watermarking"""
@@ -236,10 +238,10 @@ class OpenaiDetector(WmDetector):
             ngram: int = 1,
             seed: int = 0,
             seeding: str = 'hash',
-            salt_key: int = 35317, 
+            salt_key: int = 35317,
             **kwargs):
         super().__init__(tokenizer, ngram, seed, seeding, salt_key, **kwargs)
-    
+
     def score_tok(self, ngram_tokens, token_id):
         """ 
         score_t = -log(1 - rt[token_id]])
@@ -251,7 +253,8 @@ class OpenaiDetector(WmDetector):
         """
         seed = self.get_seed_rng(ngram_tokens)
         self.rng.manual_seed(seed)
-        rs = torch.rand(self.vocab_size, generator=self.rng) # n
+        r_dim = max(self.payload_max, self.tokenizer.vocab_size)
+        rs = torch.rand(r_dim, generator=self.rng) # n
         scores = -(1 - rs).log().roll(-token_id)
         return scores
  
