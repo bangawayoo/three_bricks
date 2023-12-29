@@ -34,8 +34,8 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sentence_transformers import SentenceTransformer
 
-from wm import (WmGenerator, OpenaiGenerator, OpenaiDetector, OpenaiNeymanPearsonDetector, 
-                OpenaiDetectorZ, MarylandGenerator, MarylandDetector, MarylandDetectorZ)
+from wm import (WmGenerator, OpenaiGenerator, OpenaiDetector, OpenaiNeymanPearsonDetector, MPACGenerator,
+                OpenaiDetectorZ, MarylandGenerator, MarylandDetector, MarylandDetectorZ, MPACDetector)
 from wm.wm_utils import compute_ber
 from wm.dataset_utils import load_hf_dataset
 import utils
@@ -101,6 +101,8 @@ def get_args_parser():
                         If None, treat prompts as a whole')
     parser.add_argument('--nsplits', type=int, default=None,
                         help='number of splits to do. If None, treat prompts as a whole')
+    parser.add_argument('--message_block_size', type=int, default=0,
+                        help='bit width of the blocked message. Only used for MPAC')
 
     # distributed parameters
     parser.add_argument('--ngpus', type=int, default=None)
@@ -213,6 +215,11 @@ def main(args):
         generator = MarylandGenerator(model, tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
                                       payload=args.payload, gamma=args.gamma, delta=args.delta,
                                       payload_max=args.payload_max)
+    elif args.method == "mpac":
+        generator = MPACGenerator(model, tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
+                                  payload=args.payload, gamma=args.gamma, delta=args.delta,
+                                  message_block_size=args.message_block_size,
+                                  payload_max=args.payload_max)
     else:
         raise NotImplementedError("method {} not implemented".format(args.method))
 
@@ -270,7 +277,7 @@ def main(args):
             eta = (len(prompts) - ii) / speed
             eta = time.strftime("%Hh%Mm%Ss", time.gmtime(eta)) 
             all_times.append(time1 - time0)
-            print(f"Generated {ii:5d} - {ii+chunk_size:5d} - Speed {speed:.2f} prompts/s - ETA {eta}")
+            print(f"Generated {ii:5d} - {ii+chunk_size:5d} - Speed {speed:.2f} prompts/s - Time {time1-time0:.1f} sec/prompt - ETA {eta}")
             # check if output is valid
             filtered_prompts, filtered_results = [], []
             for g_idx, g_token in enumerate(token_lengths):
@@ -324,6 +331,9 @@ def main(args):
     elif args.method_detect == "marylandz":
         detector = MarylandDetectorZ(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
                                      gamma=args.gamma, delta=args.delta, payload_max=args.payload_max)
+    elif args.method_detect == "mpac":
+        detector = MPACDetector(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key, gamma=args.gamma,
+                                delta=args.delta, message_block_size=4, payload_max=args.payload_max)
 
     # build sbert model
     sbert_model = SentenceTransformer('all-MiniLM-L6-v2')

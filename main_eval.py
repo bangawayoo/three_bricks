@@ -30,7 +30,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from sentence_transformers import SentenceTransformer
 
 from wm import (OpenaiDetector, OpenaiDetectorZ, OpenaiNeymanPearsonDetector, 
-                MarylandDetector, MarylandDetectorZ)
+                MarylandDetector, MarylandDetectorZ, MPACDetector)
 from wm.wm_utils import compute_ber
 from wm.dataset_utils import load_hf_dataset
 from wm.attack_utils import run_copy_paste_attack
@@ -74,6 +74,8 @@ def get_args_parser():
                         help='message')
     parser.add_argument('--payload_max', type=int, default=0, 
                         help='maximal message')
+    parser.add_argument('--message_block_size', type=int, default=0,
+                        help='bit width of the blocked message. Only used for MPAC')
     
     # attack
     parser.add_argument('--attack_name', type=str, default='none',
@@ -91,6 +93,7 @@ def get_args_parser():
     parser.add_argument('--dataset_name', type=str, default=None)
     parser.add_argument('--dataset_config_name', type=str, default=None)
     parser.add_argument('--limit_rows', type=int, default=5000)
+    parser.add_argument('--eval_human_text', type=utils.bool_inst, default=False)
 
     # useless
     parser.add_argument('--delta', type=float, default=2.0, 
@@ -137,6 +140,8 @@ def main(args):
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_dir)
     args.tokenizer = tokenizer
 
+    num_blocks = 1
+    message_block_size = math.ceil(math.log2(args.payload_max))
     # build watermark detector
     if args.method == "openai":
         detector = OpenaiDetector(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
@@ -150,6 +155,12 @@ def main(args):
     elif args.method == "marylandz":
         detector = MarylandDetectorZ(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key,
                                      payload_max=args.payload_max, gamma=args.gamma, delta=args.delta)
+    elif args.method == "mpac":
+        message_block_size = args.message_block_size
+        payload_len = math.ceil(math.log2(args.payload_max))
+        num_blocks = payload_len // message_block_size
+        detector = MPACDetector(tokenizer, args.ngram, args.seed, args.seeding, args.hash_key, gamma=args.gamma,
+                                delta=args.delta, message_block_size=message_block_size, payload_max=args.payload_max)
     elif args.method == "openainp":
         # build model
         if "llama-2" in args.model_name.lower():
@@ -188,8 +199,17 @@ def main(args):
                                                payload_max=args.payload_max)
 
     # load results and (optional) do splits
-    results, raw_data = load_results(json_path=args.json_path, result_key=args.text_key, nsamples=args.nsamples)
+    if args.eval_human_text:
+        print("Loading human generated texts...")
+        args.return_type = 'all'
+        examples = load_hf_dataset(args)
+        results = [x['baseline_completion'] for x in examples]
+        raw_data = None
+    else:
+        results, raw_data = load_results(json_path=args.json_path, result_key=args.text_key, nsamples=args.nsamples)
+
     print(f"Loaded {len(results)} results.")
+
     if args.split is not None:
         nresults = len(results)
         left = nresults * args.split // args.nsplits 
@@ -209,10 +229,8 @@ def main(args):
             new_text = tokenizer.decode(tokens_id)
             return new_text
         if args.attack_param > 0:
-            print(results[:2])
             results = [attack(text) for text in results]
             print(f"Attacked results with {attack_name}({attack_param})")
-            print(results[:2])
     elif attack_name == "copy-paste":
         results = run_copy_paste_attack(args, results)
 
@@ -220,7 +238,6 @@ def main(args):
     log_stats = []
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, 'scores.jsonl'), 'w') as f:
-
         # build sbert model
         if args.json_path_ori is not None:
             sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -234,28 +251,70 @@ def main(args):
                 'text_index': ii,
             }
             if args.do_wmeval:
+                scores_by_block = {}
+                pvalues_by_block = {}
                 # compute watermark score
-                if args.method != "openainp":
-                    scores_no_aggreg = detector.get_scores_by_t([text], scoring_method=args.scoring_method, payload_max=args.payload_max)
+                if args.method == "mpac":
+                    score_no_aggreg_by_block = detector.get_scores_by_t([text],
+                                                                        scoring_method=args.scoring_method,
+                                                                        payload_max=2**message_block_size-1)
+                    # scores_no_aggreg = score_no_aggreg_by_chunk
+                    # scores = detector.aggregate_scores(score_no_aggreg_by_chunk) # p 1
+                    # pvalues = detector.get_pvalues(score_no_aggreg_by_chunk)
+                    # scores_by_block[0] = scores
+                    # pvalues_by_chunk[0] = pvalues
+
+                    for idx in range(num_blocks):
+                        scores_no_aggreg = [score_no_aggreg_by_block[0][idx]]
+                        scores = detector.aggregate_scores(scores_no_aggreg) # p 1
+                        scores_by_block[idx] = scores
+                        pvalues = detector.get_pvalues(scores_no_aggreg)
+                        pvalues_by_block[idx] = pvalues
+
+                elif args.method != "openainp":
+                    scores_no_aggreg = detector.get_scores_by_t([text], scoring_method=args.scoring_method,
+                                                                payload_max=args.payload_max)
                     scores = detector.aggregate_scores(scores_no_aggreg) # p 1
-                    pvalues = detector.get_pvalues(scores_no_aggreg) 
+                    pvalues = detector.get_pvalues(scores_no_aggreg)
+                    scores_by_block[0] = scores
+                    pvalues_by_block[0] = pvalues
                 else:
-                    scores_no_aggreg, probs = detector.get_scores_by_t([text], scoring_method=args.scoring_method, payload_max=args.payload_max)
+                    scores_no_aggreg, probs = detector.get_scores_by_t([text], scoring_method=args.scoring_method,
+                                                                       payload_max=args.payload_max)
                     scores = detector.aggregate_scores(scores_no_aggreg) # p 1
                     pvalues = detector.get_pvalues(scores_no_aggreg, probs)
+                    scores_by_block[0] = scores
+                    pvalues_by_block[0] = pvalues
+
                 if args.payload_max:
-                    # decode payload and adjust pvalues
-                    payloads = np.argmin(pvalues, axis=1).tolist()
-                    pvalues = pvalues[:,payloads][0].tolist() # in fact pvalue is of size 1, but the format could be adapted to take multiple text at the same time
-                    scores = [float(s[payload]) for s,payload in zip(scores,payloads)]
-                    # adjust pvalue to take into account the number of tests (2**payload_max)
-                    # use exact formula for high values and (more stable) upper bound for lower values
-                    M = args.payload_max+1
-                    pvalues = [(1 - (1 - pvalue)**M) if pvalue > min(1 / M, 1e-5) else M * pvalue for pvalue in pvalues]
+                    final_pvalue = None
+                    final_score = None
+                    final_msg = ""
+                    for idx in range(num_blocks):
+                        # decode payload and adjust pvalues
+                        payloads = np.argmin(pvalues_by_block[idx], axis=1).tolist()
+                        msg_chunk = format(payloads[0], f"0{message_block_size}b")
+                        final_msg += msg_chunk
+                        # in fact pvalue is of size 1, but the format could be adapted to take multiple text at the same time
+                        pvalues = pvalues_by_block[idx]
+                        scores = scores_by_block[idx]
+                        pvalues = pvalues[:,payloads][0].tolist()
+                        scores = [float(s[payload]) for s, payload in zip(scores, payloads)]
+                        # adjust pvalue to take into account the number of tests (2**payload_max)
+                        # use exact formula for high values and (more stable) upper bound for lower values
+                        M = args.payload_max + 1
+                        pvalues = [(1 - (1 - pvalue)**M) if pvalue > min(1 / M, 1e-5) else M * pvalue for pvalue in pvalues]
+
+                    # if len(final_msg) != 8:
+                    #     breakpoint()
                     bit_width = math.ceil(math.log2(args.payload_max))
-                    example = raw_data[ii]
-                    gold_msg = format(example['gt_payload'], f"0{bit_width}b")
-                    pred_msg = format(payloads[0], f"0{bit_width}b")
+                    if raw_data:
+                        example = raw_data[ii]
+                        gt_payload = example['gt_payload']
+                    else:
+                        gt_payload = 0
+                    gold_msg = format(gt_payload, f"0{bit_width}b")
+                    pred_msg = final_msg
                     correct, total = compute_ber(pred_msg, gold_msg)
                 else:
                     payloads = [ 0 ] * len(pvalues)
@@ -263,11 +322,12 @@ def main(args):
                     scores = [float(s[0]) for s in scores]
 
                 num_tokens = [len(score_no_aggreg) for score_no_aggreg in scores_no_aggreg]
-                log_stat['num_token'] =  num_tokens[0]
-                log_stat['score'] =  scores[0]
-                log_stat['pvalue'] =  pvalues[0]
+                log_stat['num_token'] = num_tokens[0]
+                log_stat['score'] = scores[0]
+                log_stat['pvalue'] = pvalues[0]
                 log_stat['log10_pvalue'] = float(np.log10(log_stat['pvalue']))
                 log_stat['acc'] = correct / total
+                log_stat['match'] = 1 if correct == total else 0
                 log_stat['payload'] = payloads[0]
 
             if args.json_path_ori is not None:

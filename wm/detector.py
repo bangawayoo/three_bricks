@@ -420,3 +420,96 @@ class OpenaiNeymanPearsonDetector(WmDetector):
             # upper bound
             pvalue = np.exp(np.sum(-np.log(1 + c / ratio)) + c * S)
         return max(pvalue, eps)
+
+
+import math
+class MPACDetector(WmDetector):
+
+    def __init__(self, tokenizer: LlamaTokenizer, ngram: int = 1, seed: int = 0, seeding: str = 'hash',
+                 salt_key: int = 35317, gamma: float = 0.5, delta: float = 1.0, message_block_size: int = 4, **kwargs):
+        super().__init__(tokenizer, ngram, seed, seeding, salt_key, **kwargs)
+        self.gamma = gamma
+        self.delta = delta
+        self.mbs = message_block_size
+        self.payload_max = kwargs.get('payload_max')
+        payload_len = math.ceil(math.log2(self.payload_max))
+        self.num_blocks = payload_len // self.mbs
+
+
+    def score_tok(self, ngram_tokens, token_id):
+        """
+        score_t = 1 if token_id in greenlist else 0
+        The last line shifts the scores by token_id.
+        ex: scores[0] = 1 if token_id in greenlist else 0
+            scores[1] = 1 if token_id in (greenlist shifted of 1) else 0
+            ...
+        The score for each payload will be given by scores[payload]
+        """
+        seed = self.get_seed_rng(ngram_tokens)
+        self.rng.manual_seed(seed)
+        block_position = torch.randint(0, self.num_blocks, size=(1,), generator=self.rng)
+        scores = torch.zeros(self.vocab_size)
+        self.rng.manual_seed(seed)
+        vocab_permutation = torch.randperm(self.vocab_size, generator=self.rng)
+        greenlist = vocab_permutation[:int(self.gamma * self.vocab_size)]  # gamma * n toks in the greenlist
+        scores[greenlist] = 1
+        return scores.roll(-token_id), block_position.item()
+
+    def get_pvalue(self, score: int, ntoks: int, eps: float):
+        """ from cdf of a binomial distribution """
+        pvalue = special.betainc(score, 1 + ntoks - score, self.gamma)
+        return max(pvalue, eps)
+
+    def get_scores_by_t(
+        self,
+        texts: List[str],
+        scoring_method: str="none",
+        ntoks_max: int = None,
+        payload_max: int = 0
+    ) -> List[np.array]:
+        """
+        Get score increment for each token in list of texts.
+        Args:
+            texts: list of texts
+            scoring_method:
+                'none': score all ngrams
+                'v1': only score tokens for which wm window is unique
+                'v2': only score unique {wm window+tok} is unique
+            ntoks_max: maximum number of tokens
+            payload_max: maximum number of messages
+        Output:
+            score_lists: list of [np array of score increments for every token and payload] for each text
+        """
+        bsz = len(texts)
+        tokens_id = [self.tokenizer.encode(x, add_special_tokens=False) for x in texts]
+        if ntoks_max is not None:
+            tokens_id = [x[:ntoks_max] for x in tokens_id]
+        score_lists = []
+        for ii in range(bsz):
+            total_len = len(tokens_id[ii])
+            start_pos = self.ngram +1
+            rts_by_block = {idx: [] for idx in range(self.num_blocks)}
+            rts = []
+            seen_ntuples = set()
+            for cur_pos in range(start_pos, total_len):
+                ngram_tokens = tokens_id[ii][cur_pos-self.ngram:cur_pos] # h
+                if scoring_method == 'v1':
+                    tup_for_unique = tuple(ngram_tokens)
+                    if tup_for_unique in seen_ntuples:
+                        continue
+                    seen_ntuples.add(tup_for_unique)
+                elif scoring_method == 'v2':
+                    tup_for_unique = tuple(ngram_tokens + tokens_id[ii][cur_pos:cur_pos+1])
+                    if tup_for_unique in seen_ntuples:
+                        continue
+                    seen_ntuples.add(tup_for_unique)
+                rt, block_position = self.score_tok(ngram_tokens, tokens_id[ii][cur_pos])
+                rt = rt.numpy()[:payload_max+1]
+
+                rts.append(rt)
+                rts_by_block[block_position].append(rt)
+            score_lists.append(rts_by_block)
+            # score_lists.append(rts)
+        # no chunking scores_lists = [list of array]
+        # chunking scores_lists = [{position : list of arrays}]
+        return score_lists

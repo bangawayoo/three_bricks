@@ -243,3 +243,81 @@ class MarylandGenerator(WmGenerator):
             bias = bias.roll(-self.payload)
             logits[ii] += bias # add bias to greenlist words
         return logits
+
+import math
+
+class MPACGenerator(WmGenerator):
+    """ Generate text using LLaMA and Maryland's watemrarking method. """
+    def __init__(self,
+            *args,
+            gamma: float = 0.5,
+            delta: float = 1.0,
+            message_block_size: int = 4,
+            **kwargs
+        ):
+        super().__init__(*args, **kwargs)
+        self.mbs = message_block_size
+        self.payload = kwargs.get("payload", None)
+        self.payload_max = kwargs.get("payload_max", None)
+        self.gamma = gamma
+        self.delta = delta
+
+    @property
+    def blocked_payload(self):
+        payload_len = math.ceil(math.log2(self.payload_max))
+        binary_payload = format(self.payload, f"0{payload_len}b")
+        blocked_payload = []
+        for ii in range(0, len(binary_payload), self.mbs):
+            blocked_payload.append(binary_payload[ii: ii+self.mbs])
+        return blocked_payload
+
+    def sample_next(
+        self,
+        logits: torch.FloatTensor, # (bsz, vocab_size): logits for last token
+        ngram_tokens: torch.LongTensor, # (bsz, ngram): tokens to consider when seeding
+        temperature: float = 0.8, # temperature for sampling
+        top_p: float = 0.95, # top p for sampling
+    ) -> torch.LongTensor:
+        """
+        From ngram tokens, select the next token based on the following:
+        - hash the ngram tokens and get a seed
+        - use the seed to partition the vocabulary into greenlist (gamma*V words) and blacklist
+        - add delta to greenlist words' logits
+        payload (the message) is encoded by shifting the secret vector r by `payload`.
+        """
+        logits = self.logits_processor(logits, ngram_tokens)
+        if temperature > 0:
+            probs = torch.softmax(logits / temperature, dim=-1)
+            probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+            probs_sum = torch.cumsum(probs_sort, dim=-1)
+            mask = probs_sum - probs_sort > top_p
+            probs_sort[mask] = 0.0
+            probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+            next_token = torch.multinomial(probs_sort, num_samples=1) # one hot of next token, ordered by original probs
+            next_token = torch.gather(probs_idx, -1, next_token) # one hot of next token, ordered by vocab
+        else:
+            next_token = torch.argmax(logits, dim=-1)
+        next_token = next_token.reshape(-1)
+        return next_token
+
+    def logits_processor(self, logits, ngram_tokens):
+        """Process logits to mask out words in greenlist."""
+        bsz, vocab_size = logits.shape
+        logits = logits.clone()
+        blocked_payload = self.blocked_payload
+        for ii in range(ngram_tokens.shape[0]): # batch of texts
+            seed = self.get_seed_rng(ngram_tokens[ii])
+            self.rng.manual_seed(seed)
+            block_position = torch.randint(0, len(blocked_payload), size=(1,), generator=self.rng)
+            block_position = block_position.item()
+            current_payload = blocked_payload[block_position]
+            current_payload = int(current_payload, 2)
+
+            self.rng.manual_seed(seed)
+            vocab_permutation = torch.randperm(vocab_size, generator=self.rng)
+            greenlist = vocab_permutation[:int(self.gamma * vocab_size)] # gamma * n
+            bias = torch.zeros(vocab_size).to(logits.device) # n
+            bias[greenlist] = self.delta
+            bias = bias.roll(-current_payload)
+            logits[ii] += bias  # add bias to greenlist words
+        return logits
